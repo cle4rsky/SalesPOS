@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🍊 ร้านผลไม้ POS v3</title>
+<link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;600;700;800&family=Sarabun:wght@300;400;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Sarabun', sans-serif; background: #F7F9FC; }
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: #f1f5f9; }
+  ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+  @keyframes pulse-red { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  @keyframes slideIn { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ═══════════════════════════════════════════════
+   FRUIT POS v3
+   NEW: สต็อกลดอัตโนมัติ, แจ้งเตือนสต็อกใกล้หมด,
+        กราฟยอดขายรายวัน, โหมดลดราคาด่วน,
+        ต้นทุน/กำไร, สรุปยอดปิดร้าน
+   SIMPLIFIED: QR = พร้อมเพย์อย่างเดียว ไม่มีเลือกธนาคาร
+═══════════════════════════════════════════════ */
+
+const todayKey = () => new Date().toISOString().slice(0,10);
+const thaiDate = (d) => new Date(d||Date.now()).toLocaleDateString("th-TH",{year:"numeric",month:"long",day:"numeric"});
+const thaiTime = () => new Date().toLocaleTimeString("th-TH");
+const fmt = (n) => n!=null ? Number(n).toLocaleString("th-TH",{minimumFractionDigits:2,maximumFractionDigits:2}) : "0.00";
+const fmtShort = (n) => n!=null ? Number(n).toLocaleString("th-TH",{maximumFractionDigits:0}) : "0";
+
+const LS = {
+  get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch{return d}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}},
+};
+
+const T = {
+  bg:"#F7F9FC", surface:"#FFFFFF", card:"#FFFFFF",
+  border:"#E2E8F0",
+  accent:"#F97316", accentLight:"#FFF7ED", accentDark:"#EA580C",
+  green:"#22C55E", greenLight:"#F0FDF4",
+  red:"#EF4444", redLight:"#FEF2F2",
+  blue:"#3B82F6", blueLight:"#EFF6FF",
+  purple:"#8B5CF6", purpleLight:"#F5F3FF",
+  yellow:"#EAB308", yellowLight:"#FEFCE8",
+  text:"#1E293B", textSub:"#64748B", textMuted:"#94A3B8",
+  shadow:"0 1px 3px rgba(0,0,0,0.08)",
+  shadowMd:"0 4px 12px rgba(0,0,0,0.08)",
+  shadowLg:"0 8px 32px rgba(0,0,0,0.12)",
+  radiusSm:8, radius:12, radiusLg:16,
+};
+
+const INIT_PRODUCTS = [
+  {id:1,name:"มะม่วง",emoji:"🥭",price:40,cost:25,unit:"กก.",stock:20,active:true,byWeight:true,lowAlert:3},
+  {id:2,name:"แตงโม",emoji:"🍉",price:25,cost:15,unit:"กก.",stock:15,active:true,byWeight:true,lowAlert:3},
+  {id:3,name:"สับปะรด",emoji:"🍍",price:35,cost:20,unit:"ลูก",stock:10,active:true,byWeight:false,lowAlert:2},
+];
+
+const EMOJIS=["🥭","🍉","🍍","🍌","🍊","🍈","🫐","🌵","🍒","🍑","🍇","🍎","🍋","🍓","🥝","🍐","🍅","🥥","🌽"];
+
+// ── PromptPay EMV QR ──────────────────────────────────────────
+function crc16(str){
+  let crc=0xFFFF;
+  for(let i=0;i<str.length;i++){
+    crc^=str.charCodeAt(i)<<8;
+    for(let j=0;j<8;j++) crc=(crc&0x8000)?((crc<<1)^0x1021)&0xFFFF:(crc<<1)&0xFFFF;
+  }
+  return crc.toString(16).toUpperCase().padStart(4,"0");
+}
+function tlv(tag,value){return tag+String(value.length).padStart(2,"0")+value;}
+function buildPromptPayQR(phone,amount){
+  const d=phone.replace(/\D/g,"");
+  const norm=d.startsWith("0")&&d.length===10?"0066"+d.slice(1):d;
+  const merchant=tlv("29",tlv("00","A000000677010111")+tlv("01",norm));
+  let p=tlv("00","01")+tlv("01","12")+merchant+tlv("53","764");
+  if(amount>0) p+=tlv("54",amount.toFixed(2));
+  p+=tlv("58","TH")+"6304";
+  return p+crc16(p);
+}
+
+// ── QR Canvas ────────────────────────────────────────────────
+function QRCanvas({payload,size=200}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    if(!ref.current||!payload) return;
+    ref.current.innerHTML="";
+    try{
+      new QRCode(ref.current,{text:payload,width:size,height:size,colorDark:"#000",colorLight:"#fff",correctLevel:QRCode.CorrectLevel.M});
+      setTimeout(()=>{
+        const c=ref.current&&ref.current.querySelector("canvas");
+        if(!c) return;
+        const ctx=c.getContext("2d");
+        const cx=size/2,cy=size/2,r=Math.round(size*0.1);
+        ctx.beginPath();ctx.arc(cx,cy,r+4,0,Math.PI*2);ctx.fillStyle="#fff";ctx.fill();
+        ctx.beginPath();ctx.arc(cx,cy,r+4,0,Math.PI*2);ctx.strokeStyle="#2B5CDB";ctx.lineWidth=3;ctx.stroke();
+        ctx.font=`${Math.round(r*1.5)}px serif`;ctx.textAlign="center";ctx.textBaseline="middle";
+        ctx.fillText("📱",cx,cy+1);
+      },150);
+    }catch(e){console.error(e);}
+  },[payload,size]);
+  return <div ref={ref} style={{borderRadius:8,lineHeight:0}}/>;
+}
+
+// ── Base Components ───────────────────────────────────────────
+function Btn({onClick,disabled,style,children,variant="default"}){
+  const base={border:"none",borderRadius:T.radiusSm,cursor:disabled?"not-allowed":"pointer",fontFamily:"'Prompt',sans-serif",fontWeight:600,fontSize:14,transition:"all 0.15s",opacity:disabled?0.5:1};
+  const variants={
+    default:{background:T.border,color:T.text,padding:"8px 16px"},
+    primary:{background:T.accent,color:"#fff",padding:"10px 20px"},
+    success:{background:T.green,color:"#fff",padding:"10px 20px"},
+    danger:{background:T.red,color:"#fff",padding:"8px 16px"},
+    ghost:{background:"transparent",color:T.textSub,border:`1.5px solid ${T.border}`,padding:"8px 16px"},
+    warning:{background:T.yellow,color:"#fff",padding:"10px 20px"},
+  };
+  return <button onClick={disabled?undefined:onClick} style={{...base,...variants[variant],...style}}>{children}</button>;
+}
+function Card({children,style}){
+  return <div style={{background:T.card,borderRadius:T.radiusLg,border:`1px solid ${T.border}`,boxShadow:T.shadow,...style}}>{children}</div>;
+}
+function Modal({onClose,children,width=360}){
+  return(
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:500,padding:16}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:T.card,borderRadius:T.radiusLg,padding:24,width:"100%",maxWidth:width,boxShadow:T.shadowLg,border:`1px solid ${T.border}`,maxHeight:"90vh",overflowY:"auto"}}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ── Stock Alert Badge ─────────────────────────────────────────
+function StockBadge({stock,alert}){
+  if(stock<=0) return <span style={{fontSize:9,background:T.redLight,color:T.red,borderRadius:4,padding:"1px 5px",fontWeight:700}}>หมด</span>;
+  if(stock<=alert) return <span style={{fontSize:9,background:T.redLight,color:T.red,borderRadius:4,padding:"1px 5px",animation:"pulse-red 1.5s infinite"}}>⚠️ เหลือ {stock}</span>;
+  if(stock<=alert*2) return <span style={{fontSize:9,background:T.yellowLight,color:T.yellow,borderRadius:4,padding:"1px 5px"}}>เหลือ {stock}</span>;
+  return null;
+}
+
+// ── Weight/Price Input Modal ──────────────────────────────────
+function InputModal({product,discountPct,onAdd,onClose}){
+  const [mode,setMode]=useState("weight");
+  const [val,setVal]=useState("");
+
+  const rawPrice = mode==="weight"
+    ? Math.round(parseFloat(val||0)*product.price*100)/100
+    : parseFloat(val||0);
+  const weight = mode==="weight"
+    ? parseFloat(val||0)
+    : parseFloat(val||0)/product.price;
+  const finalPrice = discountPct>0 ? Math.round(rawPrice*(1-discountPct/100)*10)/10 : rawPrice;
+
+  const press=(k)=>{
+    if(k==="⌫"){setVal(v=>v.slice(0,-1));return;}
+    if(k==="."&&val.includes(".")) return;
+    if((val.split(".")[1]||"").length>=3) return;
+    setVal(v=>v==="0"?k:v+k);
+  };
+  const canAdd=val&&finalPrice>0;
+
+  return(
+    <Modal onClose={onClose} width={320}>
+      <div style={{textAlign:"center",marginBottom:16}}>
+        <div style={{fontSize:52}}>{product.emoji}</div>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:18,color:T.text}}>{product.name}</div>
+        <div style={{fontSize:13,color:T.textSub}}>฿{product.price}/{product.unit}
+          {discountPct>0&&<span style={{marginLeft:6,background:T.redLight,color:T.red,borderRadius:4,padding:"1px 6px",fontSize:11,fontWeight:700}}>ลด {discountPct}%</span>}
+        </div>
+      </div>
+      {product.byWeight&&(
+        <div style={{display:"flex",background:T.bg,borderRadius:T.radiusSm,padding:4,marginBottom:14,gap:4}}>
+          {[{v:"weight",lbl:"⚖️ ใส่น้ำหนัก"},{v:"price",lbl:"💵 ใส่ราคา"}].map(m=>(
+            <button key={m.v} onClick={()=>{setMode(m.v);setVal("");}}
+              style={{flex:1,padding:"7px 0",borderRadius:6,border:"none",cursor:"pointer",fontFamily:"'Prompt',sans-serif",fontWeight:600,fontSize:13,background:mode===m.v?T.accent:"transparent",color:mode===m.v?"#fff":T.textSub,transition:"all 0.15s"}}>
+              {m.lbl}
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={{background:T.bg,borderRadius:T.radiusSm,padding:"12px 16px",marginBottom:14,textAlign:"center",border:`1px solid ${T.border}`}}>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:4}}>{mode==="weight"?"น้ำหนัก (กก.)":"ราคา (บาท)"}</div>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontSize:36,fontWeight:800,color:T.accent,minHeight:44,letterSpacing:2}}>{val||"0"}</div>
+        <div style={{fontSize:14,color:T.green,fontWeight:700}}>
+          {mode==="weight"
+            ? discountPct>0
+              ? <><span style={{textDecoration:"line-through",color:T.textMuted,fontSize:12}}>฿{fmt(rawPrice)}</span> <span>= ฿{fmt(finalPrice)}</span></>
+              : `= ฿${fmt(finalPrice)}`
+            : `= ${weight.toFixed(3)} กก.`}
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:14}}>
+        {["1","2","3","4","5","6","7","8","9",".","0","⌫"].map(k=>(
+          <button key={k} onClick={()=>press(k)}
+            style={{padding:"13px 0",borderRadius:T.radiusSm,border:`1px solid ${T.border}`,background:k==="⌫"?T.redLight:T.surface,color:k==="⌫"?T.red:T.text,fontSize:20,fontWeight:700,cursor:"pointer",fontFamily:"'Prompt',sans-serif",boxShadow:T.shadow}}>
+            {k}
+          </button>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <Btn onClick={onClose} variant="ghost" style={{flex:1}}>ยกเลิก</Btn>
+        <Btn onClick={()=>{if(canAdd){onAdd(product,parseFloat(weight.toFixed(3)),finalPrice);onClose();}}} disabled={!canAdd} variant="primary" style={{flex:2}}>
+          ✅ เพิ่มลงตะกร้า
+        </Btn>
+      </div>
+    </Modal>
+  );
+}
+
+// ── Receipt Modal ─────────────────────────────────────────────
+function ReceiptModal({order,onClose}){
+  const handlePrint=()=>{
+    const w=window.open("","_blank","width=350,height=600");
+    w.document.write(`<html><head><meta charset="UTF-8">
+    <style>body{font-family:'Sarabun',sans-serif;padding:20px;max-width:300px;margin:0 auto}.title{text-align:center;font-size:18px;font-weight:bold;margin:8px 0}.sub{text-align:center;font-size:12px;color:#666}.line{border-top:1px dashed #999;margin:8px 0}.row{display:flex;justify-content:space-between;font-size:13px;margin:3px 0}.total{font-size:16px;font-weight:bold}.footer{text-align:center;font-size:12px;color:#888;margin-top:10px}</style>
+    </head><body>
+    <div class="title">🍊 ร้านผลไม้</div>
+    <div class="sub">ใบเสร็จรับเงิน</div>
+    <div class="sub">${order.time} | ${order.sellerName||""}</div>
+    <div class="line"></div>
+    ${order.items.map(i=>`<div class="row"><span>${i.emoji} ${i.name} ${i.byWeight?`${i.weight}กก.`:`×${i.qty}`}</span><span>฿${fmt(i.lineTotal)}</span></div>`).join("")}
+    <div class="line"></div>
+    <div class="row total"><span>รวม</span><span>฿${fmt(order.total)}</span></div>
+    ${order.method==="cash"
+      ?`<div class="row"><span>รับเงิน</span><span>฿${fmt(order.received)}</span></div><div class="row"><span>เงินทอน</span><span>฿${fmt(order.change)}</span></div>`
+      :`<div class="row"><span>ช่องทาง</span><span>📱 พร้อมเพย์</span></div>`}
+    <div class="footer">ขอบคุณที่ใช้บริการ 🙏</div>
+    </body></html>`);
+    w.document.close();
+    setTimeout(()=>{w.print();w.close();},300);
+  };
+  return(
+    <Modal onClose={onClose} width={320}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:44,marginBottom:4}}>🧾</div>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:18}}>ใบเสร็จรับเงิน</div>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:16}}>{order.time}{order.sellerName?` · ${order.sellerName}`:""}</div>
+        <div style={{borderTop:`1px dashed ${T.border}`,paddingTop:12,marginBottom:12,textAlign:"left"}}>
+          {order.items.map((item,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:14,marginBottom:6}}>
+              <span>{item.emoji} {item.name} {item.byWeight?`${item.weight}กก.`:`×${item.qty}`}</span>
+              <span style={{fontWeight:600}}>฿{fmt(item.lineTotal)}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{borderTop:`1px dashed ${T.border}`,paddingTop:12,textAlign:"left"}}>
+          <div style={{display:"flex",justifyContent:"space-between",fontWeight:700,fontSize:17,marginBottom:6}}>
+            <span>รวมทั้งหมด</span><span style={{color:T.accent}}>฿{fmt(order.total)}</span>
+          </div>
+          {order.method==="cash"&&<>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:T.textSub}}><span>รับเงิน</span><span>฿{fmt(order.received)}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:T.green,fontWeight:700}}><span>เงินทอน</span><span>฿{fmt(order.change)}</span></div>
+          </>}
+          {order.method==="qr"&&<div style={{fontSize:13,color:T.blue}}>📱 พร้อมเพย์</div>}
+        </div>
+        <div style={{fontSize:12,color:T.textMuted,margin:"12px 0 16px"}}>ขอบคุณที่ใช้บริการ 🙏</div>
+        <div style={{display:"flex",gap:8}}>
+          <Btn onClick={onClose} variant="ghost" style={{flex:1}}>ปิด</Btn>
+          <Btn onClick={handlePrint} variant="primary" style={{flex:1}}>🖨️ พิมพ์</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ── QR Payment Modal (PromptPay only, simplified) ─────────────
+function QRPayModal({total,promptPayPhone,onConfirm,onClose}){
+  const [confirmed,setConfirmed]=useState(false);
+  const [speaking,setSpeaking]=useState(false);
+  const payload=buildPromptPayQR(promptPayPhone,total);
+
+  const speak=()=>{
+    if("speechSynthesis" in window){
+      setSpeaking(true);
+      const u=new SpeechSynthesisUtterance(`รับเงิน ${Math.round(total)} บาท`);
+      u.lang="th-TH";u.rate=0.9;u.onend=()=>setSpeaking(false);
+      window.speechSynthesis.speak(u);
+    }
+  };
+  const handleConfirm=()=>{
+    setConfirmed(true);speak();
+    setTimeout(()=>onConfirm(),1200);
+  };
+
+  return(
+    <Modal onClose={onClose} width={340}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:18,marginBottom:4}}>📱 พร้อมเพย์</div>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontSize:34,fontWeight:800,color:T.accent,marginBottom:4}}>฿{fmt(total)}</div>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:14}}>สแกน QR เพื่อชำระเงิน</div>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:12}}>
+          <div style={{border:`3px solid #2B5CDB`,borderRadius:12,padding:8,background:"#fff"}}>
+            <QRCanvas payload={payload} size={200}/>
+          </div>
+        </div>
+        <div style={{background:T.blueLight,borderRadius:T.radiusSm,padding:"8px 14px",marginBottom:16,fontSize:13,color:T.blue}}>
+          📞 <strong>{promptPayPhone}</strong>
+        </div>
+        {confirmed
+          ? <div style={{background:T.greenLight,borderRadius:T.radiusSm,padding:14,color:T.green,fontWeight:700,fontSize:16}}>✅ รับเงินแล้ว {speaking&&"🔊"}</div>
+          : <div style={{display:"flex",gap:8,flexDirection:"column"}}>
+              <Btn onClick={handleConfirm} variant="success" style={{width:"100%",padding:"13px 0",fontSize:15}}>✅ รับเงินแล้ว / ยืนยัน</Btn>
+              <Btn onClick={onClose} variant="ghost" style={{width:"100%"}}>❌ ยกเลิก</Btn>
+            </div>
+        }
+      </div>
+    </Modal>
+  );
+}
+
+// ── Close Shift Modal (ปิดกะ) ─────────────────────────────────
+function CloseShiftModal({sales,sellerName,onClose}){
+  const today=todayKey();
+  const todaySales=sales[today]||[];
+  const sellerSales=sellerName?todaySales.filter(o=>o.sellerName===sellerName):todaySales;
+  const total=sellerSales.reduce((s,o)=>s+o.total,0);
+  const cashTotal=sellerSales.filter(o=>o.method==="cash").reduce((s,o)=>s+o.total,0);
+  const qrTotal=sellerSales.filter(o=>o.method==="qr").reduce((s,o)=>s+o.total,0);
+  const billCount=sellerSales.length;
+  const avgBill=billCount?total/billCount:0;
+  const now=new Date().toLocaleTimeString("th-TH");
+
+  const handlePrint=()=>{
+    const w=window.open("","_blank","width=350,height=500");
+    w.document.write(`<html><head><meta charset="UTF-8">
+    <style>body{font-family:'Sarabun',sans-serif;padding:20px;max-width:300px;margin:0 auto}.title{text-align:center;font-size:18px;font-weight:bold}.sub{text-align:center;font-size:12px;color:#666}.line{border-top:1px dashed #999;margin:8px 0}.row{display:flex;justify-content:space-between;font-size:14px;margin:5px 0}.big{font-size:20px;font-weight:bold}.footer{text-align:center;font-size:11px;color:#888;margin-top:12px}</style>
+    </head><body>
+    <div class="title">🍊 ร้านผลไม้</div>
+    <div class="sub">สรุปยอดปิดร้าน</div>
+    <div class="sub">${thaiDate(today)} | ปิดเวลา ${now}</div>
+    ${sellerName?`<div class="sub">ผู้ขาย: ${sellerName}</div>`:""}
+    <div class="line"></div>
+    <div class="row"><span>จำนวนบิล</span><span>${billCount} บิล</span></div>
+    <div class="row"><span>💵 เงินสด</span><span>฿${fmt(cashTotal)}</span></div>
+    <div class="row"><span>📱 พร้อมเพย์</span><span>฿${fmt(qrTotal)}</span></div>
+    <div class="line"></div>
+    <div class="row big"><span>รวมทั้งหมด</span><span>฿${fmt(total)}</span></div>
+    <div class="row"><span>เฉลี่ย/บิล</span><span>฿${fmt(avgBill)}</span></div>
+    <div class="footer">ขอบคุณที่ใช้บริการ 🙏</div>
+    </body></html>`);
+    w.document.close();
+    setTimeout(()=>{w.print();w.close();},300);
+  };
+
+  return(
+    <Modal onClose={onClose} width={360}>
+      <div style={{textAlign:"center",marginBottom:16}}>
+        <div style={{fontSize:44}}>🏁</div>
+        <div style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:19,marginTop:4}}>สรุปยอดปิดร้าน</div>
+        <div style={{fontSize:12,color:T.textMuted}}>{thaiDate(today)} · ปิดเวลา {now}</div>
+        {sellerName&&<div style={{fontSize:13,color:T.textSub,marginTop:2}}>👤 {sellerName}</div>}
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+        {[
+          {icon:"🧾",label:"จำนวนบิล",value:`${billCount} บิล`,color:T.blue,bg:T.blueLight},
+          {icon:"📊",label:"เฉลี่ย/บิล",value:`฿${fmt(avgBill)}`,color:T.purple,bg:T.purpleLight},
+          {icon:"💵",label:"เงินสด",value:`฿${fmt(cashTotal)}`,color:T.green,bg:T.greenLight},
+          {icon:"📱",label:"พร้อมเพย์",value:`฿${fmt(qrTotal)}`,color:T.blue,bg:T.blueLight},
+        ].map(c=>(
+          <div key={c.label} style={{background:c.bg,borderRadius:T.radiusSm,padding:"12px 14px"}}>
+            <div style={{fontSize:20}}>{c.icon}</div>
+            <div style={{fontFamily:"'Prompt',sans-serif",fontSize:17,fontWeight:800,color:c.color,marginTop:2}}>{c.value}</div>
+            <div style={{fontSize:11,color:T.textMuted}}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{background:T.accentLight,borderRadius:T.radiusSm,padding:"14px 16px",marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:15,color:T.text}}>💰 ยอดรวมทั้งหมด</span>
+        <span style={{fontFamily:"'Prompt',sans-serif",fontSize:26,fontWeight:800,color:T.accent}}>฿{fmt(total)}</span>
+      </div>
+
+      <div style={{display:"flex",gap:8}}>
+        <Btn onClick={onClose} variant="ghost" style={{flex:1}}>ปิด</Btn>
+        <Btn onClick={handlePrint} variant="primary" style={{flex:1}}>🖨️ พิมพ์สรุป</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+// ── Mini Bar Chart ────────────────────────────────────────────
+function MiniBarChart({data,height=80}){
+  if(!data||data.length===0) return <div style={{textAlign:"center",color:T.textMuted,padding:20,fontSize:13}}>ยังไม่มีข้อมูล</div>;
+  const max=Math.max(...data.map(d=>d.v),1);
+  return(
+    <div style={{display:"flex",alignItems:"flex-end",gap:4,height,paddingTop:8}}>
+      {data.map((d,i)=>{
+        const pct=d.v/max;
+        const isToday=d.k===todayKey();
+        return(
+          <div key={d.k} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+            <div style={{fontSize:9,color:T.textMuted,fontWeight:600}}>{d.v>0?`฿${fmtShort(d.v)}`:""}</div>
+            <div style={{width:"100%",background:isToday?T.accent:T.blue,borderRadius:"3px 3px 0 0",height:`${Math.max(pct*100,2)}%`,opacity:isToday?1:0.5,transition:"height 0.3s"}}/>
+            <div style={{fontSize:8,color:isToday?T.accent:T.textMuted,fontWeight:isToday?700:400,whiteSpace:"nowrap"}}>{d.label}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Edit Product Row ──────────────────────────────────────────
+function EditRow({p,onSave,onCancel}){
+  const [f,setF]=useState({name:p.name,price:p.price,cost:p.cost||0,unit:p.unit,stock:p.stock,byWeight:p.byWeight,lowAlert:p.lowAlert||3});
+  const inp={border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"6px 10px",fontFamily:"'Sarabun',sans-serif",fontSize:13,outline:"none",background:T.bg,color:T.text,boxSizing:"border-box"};
+  return(
+    <div style={{flex:1,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+      <input value={f.name} onChange={e=>setF(v=>({...v,name:e.target.value}))} style={{...inp,width:100}} placeholder="ชื่อ"/>
+      <input type="number" value={f.price} onChange={e=>setF(v=>({...v,price:+e.target.value}))} style={{...inp,width:65}} placeholder="ราคา"/>
+      <input type="number" value={f.cost} onChange={e=>setF(v=>({...v,cost:+e.target.value}))} style={{...inp,width:65}} placeholder="ทุน"/>
+      <select value={f.unit} onChange={e=>setF(v=>({...v,unit:e.target.value}))} style={{...inp,width:70}}>
+        {["กก.","ลูก","หวี","กล่อง","ชิ้น"].map(u=><option key={u}>{u}</option>)}
+      </select>
+      <input type="number" value={f.stock} onChange={e=>setF(v=>({...v,stock:+e.target.value}))} style={{...inp,width:60}} placeholder="สต็อก"/>
+      <input type="number" value={f.lowAlert} onChange={e=>setF(v=>({...v,lowAlert:+e.target.value}))} style={{...inp,width:55}} placeholder="แจ้ง"/>
+      <label style={{fontSize:11,color:T.textSub,display:"flex",alignItems:"center",gap:4,cursor:"pointer",whiteSpace:"nowrap"}}>
+        <input type="checkbox" checked={f.byWeight} onChange={e=>setF(v=>({...v,byWeight:e.target.checked}))}/> ⚖️
+      </label>
+      <Btn onClick={()=>onSave(f)} variant="success" style={{padding:"5px 12px",fontSize:13}}>บันทึก</Btn>
+      <Btn onClick={onCancel} variant="ghost" style={{padding:"5px 10px",fontSize:13}}>ยกเลิก</Btn>
+    </div>
+  );
+}
+
+// ── Admin PIN changer ─────────────────────────────────────────
+function AdminPinChanger({current,onChange}){
+  const [oldPin,setOldPin]=useState("");
+  const [newPin,setNewPin]=useState("");
+  const [conf,setConf]=useState("");
+  const [msg,setMsg]=useState(null);
+  const save=()=>{
+    if(oldPin!==current){setMsg({ok:false,text:"รหัสเก่าไม่ถูกต้อง"});return;}
+    if(newPin.length<4){setMsg({ok:false,text:"รหัสใหม่ต้องมีอย่างน้อย 4 ตัว"});return;}
+    if(newPin!==conf){setMsg({ok:false,text:"รหัสยืนยันไม่ตรงกัน"});return;}
+    onChange(newPin);setOldPin("");setNewPin("");setConf("");
+    setMsg({ok:true,text:"เปลี่ยนรหัสสำเร็จ ✅"});
+  };
+  const inp={border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"9px 12px",fontSize:14,outline:"none",background:T.bg,color:T.text,width:"100%",boxSizing:"border-box",marginBottom:10,fontFamily:"'Sarabun',sans-serif"};
+  return(
+    <div>
+      <input type="password" placeholder="รหัสเก่า" value={oldPin} onChange={e=>setOldPin(e.target.value)} style={inp}/>
+      <input type="password" placeholder="รหัสใหม่" value={newPin} onChange={e=>setNewPin(e.target.value)} style={inp}/>
+      <input type="password" placeholder="ยืนยันรหัสใหม่" value={conf} onChange={e=>setConf(e.target.value)} style={{...inp,marginBottom:12}}/>
+      {msg&&<div style={{fontSize:13,color:msg.ok?T.green:T.red,marginBottom:10}}>{msg.text}</div>}
+      <Btn onClick={save} variant="primary" style={{width:"100%",padding:"10px 0"}}>บันทึกรหัสใหม่</Btn>
+    </div>
+  );
+}
+
+// ── Seller Login ──────────────────────────────────────────────
+function SellerLogin({sellers,onLogin}){
+  const [name,setName]=useState("");
+  const [custom,setCustom]=useState(false);
+  return(
+    <div style={{minHeight:"100vh",background:T.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"'Prompt',sans-serif"}}>
+      <div style={{fontSize:60,marginBottom:8}}>🍊</div>
+      <div style={{fontWeight:800,fontSize:26,color:T.text,marginBottom:4}}>ร้านผลไม้</div>
+      <div style={{fontSize:14,color:T.textMuted,marginBottom:32}}>ระบบ POS v3</div>
+      <Card style={{width:"100%",maxWidth:380,padding:28}}>
+        <div style={{fontWeight:700,fontSize:17,color:T.text,marginBottom:20,textAlign:"center"}}>👤 ใครเป็นคนขายตอนนี้?</div>
+        {sellers.length>0&&!custom&&<>
+          <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:14}}>
+            {sellers.map(s=>(
+              <button key={s} onClick={()=>onLogin(s)}
+                style={{padding:"12px 16px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:T.surface,cursor:"pointer",fontFamily:"'Prompt',sans-serif",fontWeight:600,fontSize:15,color:T.text,textAlign:"left",display:"flex",alignItems:"center",gap:10,transition:"all 0.15s"}}
+                onMouseOver={e=>{e.currentTarget.style.borderColor=T.accent;e.currentTarget.style.background=T.accentLight;}}
+                onMouseOut={e=>{e.currentTarget.style.borderColor=T.border;e.currentTarget.style.background=T.surface;}}>
+                <span>👤</span> {s}
+              </button>
+            ))}
+          </div>
+          <Btn onClick={()=>setCustom(true)} variant="ghost" style={{width:"100%",marginBottom:8}}>+ กรอกชื่อใหม่</Btn>
+        </>}
+        {(custom||sellers.length===0)&&<div style={{marginBottom:14}}>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="พิมพ์ชื่อผู้ขาย..."
+            onKeyDown={e=>e.key==="Enter"&&name.trim()&&onLogin(name.trim())}
+            style={{width:"100%",padding:"12px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,fontFamily:"'Prompt',sans-serif",fontSize:15,outline:"none",boxSizing:"border-box",color:T.text,background:T.bg}} autoFocus/>
+          <Btn onClick={()=>name.trim()&&onLogin(name.trim())} disabled={!name.trim()} variant="primary" style={{width:"100%",marginTop:10,padding:"12px 0",fontSize:15}}>เริ่มขาย →</Btn>
+          {sellers.length>0&&<Btn onClick={()=>setCustom(false)} variant="ghost" style={{width:"100%",marginTop:8}}>← กลับ</Btn>}
+        </div>}
+      </Card>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+//  MAIN APP
+// ══════════════════════════════════════════════
+function FruitPOS(){
+  const [products,setProducts]=useState(()=>LS.get("pos_products_v3",INIT_PRODUCTS));
+  const [sales,setSales]=useState(()=>LS.get("pos_sales",{}));
+  const [settings,setSettings]=useState(()=>LS.get("pos_settings_v3",{adminPin:"1234",promptPayPhone:"0812345678",sellers:[],discountPct:0,discountActive:false,lowAlertDefault:3}));
+  const [tab,setTab]=useState("pos");
+  const [currentSeller,setCurrentSeller]=useState(null);
+  const [cart,setCart]=useState([]);
+  const [received,setReceived]=useState("");
+  const [payMethod,setPayMethod]=useState("cash");
+  const [inputModal,setInputModal]=useState(null);
+  const [showQRModal,setShowQRModal]=useState(false);
+  const [showReceipt,setShowReceipt]=useState(false);
+  const [showCloseShift,setShowCloseShift]=useState(false);
+  const [lastOrder,setLastOrder]=useState(null);
+  const [adminPinInput,setAdminPinInput]=useState("");
+  const [pinOk,setPinOk]=useState(false);
+  const [editingId,setEditingId]=useState(null);
+  const [newProd,setNewProd]=useState({name:"",emoji:"🍎",price:"",cost:"",unit:"กก.",stock:"",byWeight:true,lowAlert:3});
+  const [showEmoji,setShowEmoji]=useState(false);
+  const [reportDate,setReportDate]=useState(todayKey());
+  const [showHistory,setShowHistory]=useState(false);
+  const [historyDate,setHistoryDate]=useState(todayKey());
+  const [adminSubTab,setAdminSubTab]=useState("products");
+  const [newSellerInput,setNewSellerInput]=useState("");
+
+  useEffect(()=>LS.set("pos_products_v3",products),[products]);
+  useEffect(()=>LS.set("pos_sales",sales),[sales]);
+  useEffect(()=>LS.set("pos_settings_v3",settings),[settings]);
+
+  // ── สินค้าที่ใกล้หมด (global alert) ─────────────
+  const lowStockItems=useMemo(()=>products.filter(p=>p.active&&p.stock>0&&p.stock<=(p.lowAlert||3)),[products]);
+  const outOfStockItems=useMemo(()=>products.filter(p=>p.active&&p.stock<=0),[products]);
+
+  const total=cart.reduce((s,i)=>s+i.lineTotal,0);
+  const change=parseFloat(received||0)-total;
+  const activeProducts=products.filter(p=>p.active);
+  const allDates=Object.keys(sales).sort().reverse();
+
+  // ── กดสินค้า ─────────────────────────────────────
+  const handleClick=(p)=>{
+    if(p.stock<=0) return;
+    if(p.byWeight) setInputModal(p);
+    else addCount(p);
+  };
+
+  const addCount=(p)=>{
+    const discPct=settings.discountActive?settings.discountPct:0;
+    const unitPrice=discPct>0?Math.round(p.price*(1-discPct/100)*10)/10:p.price;
+    setCart(prev=>{
+      const ex=prev.find(i=>i.id===p.id&&!i.byWeight);
+      if(ex) return prev.map(i=>i.id===p.id&&!i.byWeight?{...i,qty:i.qty+1,lineTotal:Math.round((i.lineTotal+unitPrice)*100)/100}:i);
+      return [...prev,{...p,qty:1,lineTotal:unitPrice,byWeight:false,discountPct:discPct,cartKey:Date.now()+Math.random()}];
+    });
+  };
+
+  const addWeight=(p,weight,lineTotal)=>
+    setCart(prev=>[...prev,{...p,weight,qty:1,lineTotal,byWeight:true,discountPct:settings.discountActive?settings.discountPct:0,cartKey:Date.now()+Math.random()}]);
+
+  const removeItem=(cartKey)=>setCart(prev=>prev.filter(i=>i.cartKey!==cartKey));
+  const clearCart=()=>{setCart([]);setReceived("");};
+
+  // ── ชำระเงิน + ลดสต็อกอัตโนมัติ ─────────────────
+  const completeCheckout=(method)=>{
+    if(!cart.length) return;
+    const order={
+      id:Date.now(),items:[...cart],total,
+      received:method==="cash"?parseFloat(received):total,
+      change:method==="cash"?change:0,
+      method,time:thaiTime(),date:todayKey(),sellerName:currentSeller||"",
+    };
+    // บันทึกการขาย
+    setSales(prev=>{const k=todayKey();return{...prev,[k]:[...(prev[k]||[]),order]};});
+    // ลดสต็อกอัตโนมัติ
+    setProducts(prev=>prev.map(p=>{
+      const sold=cart.filter(i=>i.id===p.id);
+      if(!sold.length) return p;
+      const totalUsed=sold.reduce((s,i)=>s+(i.byWeight?i.weight:i.qty),0);
+      return{...p,stock:Math.max(0,Math.round((p.stock-totalUsed)*1000)/1000)};
+    }));
+    setLastOrder(order);
+    setCart([]);setReceived("");
+    setShowQRModal(false);setShowReceipt(true);
+  };
+
+  const handleCashCheckout=()=>{if(!cart.length||change<0||!received) return; completeCheckout("cash");};
+
+  // ── ลบ/จัดการข้อมูล ──────────────────────────────
+  const deleteOrder=(date,orderId)=>{
+    setSales(prev=>{
+      const u={...prev};
+      u[date]=(u[date]||[]).filter(o=>o.id!==orderId);
+      if(u[date].length===0) delete u[date];
+      return{...u};
+    });
+  };
+
+  const addProd=()=>{
+    if(!newProd.name||!newProd.price) return;
+    setProducts(prev=>[...prev,{...newProd,id:Date.now(),price:+newProd.price,cost:+newProd.cost||0,stock:+newProd.stock||0,active:true,lowAlert:+newProd.lowAlert||3}]);
+    setNewProd({name:"",emoji:"🍎",price:"",cost:"",unit:"กก.",stock:"",byWeight:true,lowAlert:3});
+  };
+
+  const deleteProduct=(id)=>{if(window.confirm("ลบสินค้านี้?")) setProducts(prev=>prev.filter(x=>x.id!==id));};
+  const deleteSeller=(s)=>setSettings(prev=>({...prev,sellers:prev.sellers.filter(x=>x!==s)}));
+
+  // ── รายงาน ───────────────────────────────────────
+  const rSales=sales[reportDate]||[];
+  const rTotal=rSales.reduce((s,o)=>s+o.total,0);
+  const rCost=rSales.reduce((s,o)=>s+o.items.reduce((ss,item)=>{
+    const prod=products.find(p=>p.id===item.id);
+    const cost=(prod?.cost||0)*(item.byWeight?item.weight:item.qty);
+    return ss+cost;
+  },0),0);
+  const rProfit=rTotal-rCost;
+  const cashO=rSales.filter(o=>o.method==="cash");
+  const qrO=rSales.filter(o=>o.method==="qr");
+  const cashT=cashO.reduce((s,o)=>s+o.total,0);
+  const qrT=qrO.reduce((s,o)=>s+o.total,0);
+
+  const topItems=()=>{
+    const m={};
+    rSales.forEach(o=>o.items.forEach(i=>{m[i.name]=(m[i.name]||0)+(i.byWeight?i.weight:i.qty);}));
+    return Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  };
+
+  // กราฟยอดขาย 7 วันล่าสุด
+  const last7=useMemo(()=>{
+    const days=[];
+    for(let i=6;i>=0;i--){
+      const d=new Date();d.setDate(d.getDate()-i);
+      const k=d.toISOString().slice(0,10);
+      const label=i===0?"วันนี้":i===1?"เมื่อวาน":`${d.getDate()}/${d.getMonth()+1}`;
+      const v=(sales[k]||[]).reduce((s,o)=>s+o.total,0);
+      days.push({k,label,v});
+    }
+    return days;
+  },[sales]);
+
+  const downloadCSV=(range="day")=>{
+    let rows=[["วันที่","เวลา","บิล#","ผู้ขาย","สินค้า","น้ำหนัก/จำนวน","ราคา","ต้นทุน","วิธีชำระ","ยอดรวม"]];
+    const dates=range==="day"?[reportDate]:allDates;
+    dates.forEach(d=>{
+      (sales[d]||[]).forEach(o=>{
+        o.items.forEach(item=>{
+          const prod=products.find(p=>p.id===item.id);
+          const cost=(prod?.cost||0)*(item.byWeight?item.weight:item.qty);
+          rows.push([d,o.time,o.id,o.sellerName||"",item.name,
+            item.byWeight?`${item.weight}กก.`:`${item.qty}ชิ้น`,
+            item.lineTotal.toFixed(2),cost.toFixed(2),
+            o.method==="cash"?"เงินสด":"พร้อมเพย์",o.total.toFixed(2)]);
+        });
+      });
+    });
+    const csv="\uFEFF"+rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\r\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");a.style.display="none";a.href=url;
+    a.download=`sales_${range==="day"?reportDate:"all"}_${Date.now()}.csv`;
+    document.body.appendChild(a);a.click();
+    setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},300);
+  };
+
+  if(!currentSeller){
+    return <SellerLogin sellers={settings.sellers} onLogin={name=>{
+      if(!settings.sellers.includes(name)) setSettings(s=>({...s,sellers:[...s.sellers,name]}));
+      setCurrentSeller(name);
+    }}/>;
+  }
+
+  return(
+    <div style={{display:"flex",height:"100vh",background:T.bg,fontFamily:"'Sarabun',sans-serif",overflow:"hidden"}}>
+
+      {/* ── Modals ─── */}
+      {inputModal&&<InputModal product={inputModal} discountPct={settings.discountActive?settings.discountPct:0} onAdd={addWeight} onClose={()=>setInputModal(null)}/>}
+      {showQRModal&&<QRPayModal total={total} promptPayPhone={settings.promptPayPhone} onConfirm={()=>completeCheckout("qr")} onClose={()=>setShowQRModal(false)}/>}
+      {showReceipt&&lastOrder&&<ReceiptModal order={lastOrder} onClose={()=>setShowReceipt(false)}/>}
+      {showCloseShift&&<CloseShiftModal sales={sales} sellerName={currentSeller} onClose={()=>setShowCloseShift(false)}/>}
+
+      {/* ── ประวัติ Modal ─── */}
+      {showHistory&&(
+        <Modal onClose={()=>setShowHistory(false)} width={480}>
+          <div style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:17,marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>📋 ประวัติการขาย</span>
+            <select value={historyDate} onChange={e=>setHistoryDate(e.target.value)}
+              style={{border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"5px 8px",fontSize:13,outline:"none",background:T.bg,color:T.text}}>
+              {allDates.length===0&&<option value={todayKey()}>วันนี้</option>}
+              {allDates.map(d=><option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          {(sales[historyDate]||[]).length===0
+            ?<div style={{textAlign:"center",color:T.textMuted,padding:24}}>ยังไม่มีการขาย</div>
+            :<div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {[...(sales[historyDate]||[])].reverse().map(o=>(
+                <div key={o.id} style={{background:T.bg,borderRadius:T.radiusSm,padding:"12px 14px",border:`1px solid ${T.border}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <div>
+                      <span style={{fontWeight:700,color:T.text}}>{o.time}</span>
+                      {o.sellerName&&<span style={{fontSize:12,color:T.textMuted,marginLeft:8}}>· {o.sellerName}</span>}
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontWeight:700,color:T.accent}}>฿{fmt(o.total)}</span>
+                      <button onClick={()=>{if(window.confirm("ลบรายการนี้?")) deleteOrder(historyDate,o.id);}}
+                        style={{background:T.redLight,border:"none",borderRadius:6,color:T.red,cursor:"pointer",padding:"3px 8px",fontSize:12}}>🗑️</button>
+                    </div>
+                  </div>
+                  <div style={{fontSize:12,color:T.textSub}}>{o.method==="cash"?"💵 เงินสด":"📱 พร้อมเพย์"} · {o.items.length} รายการ</div>
+                  <div style={{fontSize:12,color:T.textMuted,marginTop:3}}>{o.items.map(i=>`${i.emoji}${i.name}`).join(", ")}</div>
+                </div>
+              ))}
+            </div>
+          }
+          <div style={{marginTop:14,paddingTop:14,borderTop:`1px solid ${T.border}`,display:"flex",gap:8}}>
+            <Btn onClick={()=>{if(window.confirm(`ลบประวัติทั้งหมดของ ${historyDate}?`)) setSales(p=>{const n={...p};delete n[historyDate];return n;});}} variant="danger" style={{flex:1,fontSize:13}}>🗑️ ลบวันนี้</Btn>
+            <Btn onClick={()=>{if(window.confirm("ลบประวัติทั้งหมด?")) setSales({});}} variant="ghost" style={{flex:1,fontSize:13,color:T.red,borderColor:T.red}}>⚠️ ลบทั้งหมด</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {/* ── Sidebar ─── */}
+      <div style={{width:68,background:T.surface,display:"flex",flexDirection:"column",alignItems:"center",paddingTop:16,gap:4,borderRight:`1px solid ${T.border}`,boxShadow:"2px 0 8px rgba(0,0,0,0.04)",flexShrink:0}}>
+        <div style={{fontSize:26,marginBottom:12}}>🍊</div>
+        {[{k:"pos",icon:"🛒",lbl:"ขาย"},{k:"admin",icon:"⚙️",lbl:"จัดการ"},{k:"report",icon:"📊",lbl:"รายงาน"}].map(t=>(
+          <button key={t.k} onClick={()=>setTab(t.k)}
+            style={{width:52,height:52,borderRadius:T.radiusSm,border:"none",cursor:"pointer",background:tab===t.k?T.accentLight:"transparent",color:tab===t.k?T.accent:T.textMuted,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,fontSize:20,transition:"all 0.15s",boxShadow:tab===t.k?`inset 0 0 0 1.5px ${T.accent}`:"none",position:"relative"}}>
+            <span>{t.icon}</span>
+            <span style={{fontSize:9,fontWeight:700,fontFamily:"'Prompt',sans-serif"}}>{t.lbl}</span>
+            {/* Badge สต็อกใกล้หมด */}
+            {t.k==="admin"&&(lowStockItems.length+outOfStockItems.length)>0&&(
+              <span style={{position:"absolute",top:4,right:4,background:T.red,color:"#fff",fontSize:8,fontWeight:700,borderRadius:10,minWidth:14,height:14,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>
+                {lowStockItems.length+outOfStockItems.length}
+              </span>
+            )}
+          </button>
+        ))}
+        <div style={{flex:1}}/>
+        {/* ปิดกะ */}
+        <button onClick={()=>setShowCloseShift(true)} title="ปิดกะ/สรุปยอด"
+          style={{width:44,height:44,borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:T.greenLight,cursor:"pointer",marginBottom:6,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontSize:16,gap:1}}>
+          🏁
+          <span style={{fontSize:7,color:T.green,fontWeight:700,fontFamily:"'Prompt',sans-serif"}}>ปิดกะ</span>
+        </button>
+        <button onClick={()=>setCurrentSeller(null)} title="เปลี่ยนผู้ขาย"
+          style={{width:40,height:40,borderRadius:"50%",border:`2px solid ${T.border}`,background:T.accentLight,cursor:"pointer",marginBottom:12,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>
+          👤
+        </button>
+      </div>
+
+      {/* ── Main ─── */}
+      <div style={{flex:1,display:"flex",overflow:"hidden",minWidth:0}}>
+
+        {/* ════ POS TAB ════ */}
+        {tab==="pos"&&(
+          <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+            {/* Product Grid */}
+            <div style={{flex:1,display:"flex",flexDirection:"column",padding:16,overflow:"hidden"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                <div>
+                  <span style={{fontFamily:"'Prompt',sans-serif",fontSize:17,fontWeight:700,color:T.text}}>เลือกสินค้า</span>
+                  <span style={{fontSize:12,color:T.textMuted,marginLeft:8}}>{thaiDate()}</span>
+                </div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  {/* แบนเนอร์ลดราคาด่วน */}
+                  {settings.discountActive&&(
+                    <div style={{background:T.redLight,border:`1.5px solid ${T.red}`,borderRadius:20,padding:"3px 12px",fontSize:12,fontWeight:700,color:T.red,animation:"pulse-red 2s infinite"}}>
+                      🔥 ลด {settings.discountPct}%
+                    </div>
+                  )}
+                  <div style={{fontSize:13,background:T.accentLight,color:T.accent,borderRadius:20,padding:"4px 12px",fontWeight:600}}>
+                    👤 {currentSeller}
+                  </div>
+                </div>
+              </div>
+
+              {/* แจ้งเตือนสต็อกใกล้หมด */}
+              {(lowStockItems.length>0||outOfStockItems.length>0)&&(
+                <div style={{background:T.yellowLight,border:`1px solid ${T.yellow}`,borderRadius:T.radiusSm,padding:"8px 12px",marginBottom:10,fontSize:12,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <span>⚠️</span>
+                  {outOfStockItems.length>0&&<span style={{color:T.red,fontWeight:700}}>หมด: {outOfStockItems.map(p=>`${p.emoji}${p.name}`).join(", ")}</span>}
+                  {lowStockItems.length>0&&<span style={{color:T.yellow,fontWeight:600}}>ใกล้หมด: {lowStockItems.map(p=>`${p.emoji}${p.name}(${p.stock})`).join(", ")}</span>}
+                </div>
+              )}
+
+              <div style={{flex:1,overflowY:"auto",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(110px,1fr))",gap:10,alignContent:"start"}}>
+                {activeProducts.map(p=>(
+                  <button key={p.id} onClick={()=>handleClick(p)} disabled={p.stock<=0}
+                    style={{background:T.surface,border:`1.5px solid ${p.stock<=0?T.redLight:T.border}`,borderRadius:T.radiusLg,padding:"14px 8px",cursor:p.stock<=0?"not-allowed":"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:4,opacity:p.stock<=0?0.4:1,transition:"all 0.15s",boxShadow:T.shadow,position:"relative"}}
+                    onMouseOver={e=>{if(p.stock>0){e.currentTarget.style.borderColor=T.accent;e.currentTarget.style.boxShadow=`0 4px 12px ${T.accent}30`;e.currentTarget.style.transform="translateY(-2px)";}}}
+                    onMouseOut={e=>{e.currentTarget.style.borderColor=p.stock<=0?T.redLight:T.border;e.currentTarget.style.boxShadow=T.shadow;e.currentTarget.style.transform="none";}}>
+                    <span style={{fontSize:34}}>{p.emoji}</span>
+                    <span style={{fontFamily:"'Prompt',sans-serif",fontWeight:600,fontSize:13,color:T.text,textAlign:"center",lineHeight:1.2}}>{p.name}</span>
+                    <span style={{fontSize:12,color:settings.discountActive?T.red:T.accent,fontWeight:700}}>
+                      {settings.discountActive
+                        ?`฿${Math.round(p.price*(1-settings.discountPct/100)*10)/10}`
+                        :`฿${p.price}`}
+                    </span>
+                    <span style={{fontSize:10,color:p.byWeight?T.blue:T.textMuted}}>{p.byWeight?"⚖️ กก.":`📦 ${p.unit}`}</span>
+                    <StockBadge stock={p.stock} alert={p.lowAlert||3}/>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Cart & Payment */}
+            <div style={{width:300,background:T.surface,borderLeft:`1px solid ${T.border}`,display:"flex",flexDirection:"column",overflow:"hidden",flexShrink:0}}>
+              <div style={{padding:"14px 16px",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:15,color:T.text}}>🛒 ตะกร้า ({cart.length})</span>
+                {cart.length>0&&<button onClick={clearCart} style={{background:T.redLight,border:"none",borderRadius:6,color:T.red,cursor:"pointer",padding:"4px 10px",fontSize:12,fontFamily:"'Prompt',sans-serif",fontWeight:600}}>ล้าง</button>}
+              </div>
+              <div style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
+                {cart.length===0
+                  ?<div style={{textAlign:"center",color:T.textMuted,padding:"40px 0",fontSize:14}}><div style={{fontSize:36,marginBottom:8}}>🛒</div>ยังไม่มีสินค้า</div>
+                  :cart.map(item=>(
+                    <div key={item.cartKey} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.border}`}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:600,fontSize:13,color:T.text}}>{item.emoji} {item.name}</div>
+                        <div style={{fontSize:11,color:T.textMuted}}>
+                          {item.byWeight?`${item.weight} กก.`:`×${item.qty}`}
+                          {item.discountPct>0&&<span style={{color:T.red,marginLeft:4}}>-{item.discountPct}%</span>}
+                        </div>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+                        <span style={{fontWeight:700,color:T.accent,fontSize:14}}>฿{fmt(item.lineTotal)}</span>
+                        <button onClick={()=>removeItem(item.cartKey)} style={{background:"none",border:"none",color:T.red,cursor:"pointer",fontSize:18,lineHeight:1,padding:"0 2px"}}>×</button>
+                      </div>
+                    </div>
+                  ))
+                }
+              </div>
+
+              {/* Payment */}
+              <div style={{padding:14,borderTop:`1px solid ${T.border}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <span style={{color:T.textSub,fontSize:13}}>ยอดรวม</span>
+                  <span style={{fontFamily:"'Prompt',sans-serif",fontSize:26,fontWeight:800,color:T.accent}}>฿{fmt(total)}</span>
+                </div>
+                <div style={{display:"flex",gap:6,marginBottom:12}}>
+                  {[{k:"cash",lbl:"💵 เงินสด"},{k:"qr",lbl:"📱 พร้อมเพย์"}].map(m=>(
+                    <button key={m.k} onClick={()=>setPayMethod(m.k)}
+                      style={{flex:1,padding:"8px 0",borderRadius:T.radiusSm,cursor:"pointer",border:`1.5px solid ${payMethod===m.k?T.accent:T.border}`,background:payMethod===m.k?T.accentLight:T.surface,color:payMethod===m.k?T.accent:T.textSub,fontSize:12,fontWeight:700,fontFamily:"'Prompt',sans-serif",transition:"all 0.15s"}}>
+                      {m.lbl}
+                    </button>
+                  ))}
+                </div>
+
+                {payMethod==="cash"?(
+                  <>
+                    <div style={{fontSize:11,color:T.textMuted,marginBottom:4}}>รับเงิน (บาท)</div>
+                    <input type="number" value={received} onChange={e=>setReceived(e.target.value)} placeholder="0"
+                      style={{width:"100%",background:T.bg,border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"9px 12px",color:T.text,fontSize:18,fontWeight:700,outline:"none",boxSizing:"border-box",marginBottom:8}}/>
+                    <div style={{display:"flex",gap:4,marginBottom:8,flexWrap:"wrap"}}>
+                      {[20,50,100,500,1000].map(v=>(
+                        <button key={v} onClick={()=>setReceived(String(v))}
+                          style={{flex:1,minWidth:36,background:T.bg,border:`1px solid ${T.border}`,borderRadius:6,color:T.textSub,fontSize:11,padding:"5px 0",cursor:"pointer"}}>
+                          ฿{v}
+                        </button>
+                      ))}
+                    </div>
+                    {received&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:8}}>
+                      <span style={{color:T.textMuted}}>เงินทอน</span>
+                      <span style={{fontWeight:700,color:change>=0?T.green:T.red}}>{change>=0?`฿${fmt(change)}`:"เงินไม่พอ"}</span>
+                    </div>}
+                    <Btn onClick={handleCashCheckout} disabled={!cart.length||change<0||!received} variant="primary" style={{width:"100%",padding:"13px 0",fontSize:15}}>
+                      ✅ ชำระเงินสด
+                    </Btn>
+                    {received&&<button onClick={()=>setReceived("")} style={{width:"100%",marginTop:6,background:"transparent",border:"none",color:T.textMuted,cursor:"pointer",fontSize:12,fontFamily:"'Prompt',sans-serif"}}>← ล้างจำนวนเงิน</button>}
+                  </>
+                ):(
+                  <Btn onClick={()=>{if(!cart.length) return; setShowQRModal(true);}} disabled={!cart.length} variant="primary" style={{width:"100%",padding:"13px 0",fontSize:15}}>
+                    📱 แสดง QR พร้อมเพย์
+                  </Btn>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ════ ADMIN TAB ════ */}
+        {tab==="admin"&&(
+          <div style={{flex:1,padding:20,overflowY:"auto"}}>
+            {!pinOk?(
+              <div style={{maxWidth:340,margin:"60px auto",textAlign:"center"}}>
+                <div style={{fontSize:52,marginBottom:12}}>🔒</div>
+                <div style={{fontFamily:"'Prompt',sans-serif",fontSize:20,fontWeight:700,marginBottom:20}}>ใส่รหัส Admin</div>
+                <input type="password" value={adminPinInput} onChange={e=>setAdminPinInput(e.target.value)} placeholder="รหัส PIN"
+                  onKeyDown={e=>{if(e.key==="Enter"){if(adminPinInput===settings.adminPin)setPinOk(true);else{setAdminPinInput("");alert("รหัสไม่ถูกต้อง");}}}}
+                  style={{width:"100%",background:T.bg,border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"12px 16px",color:T.text,fontSize:20,letterSpacing:8,textAlign:"center",outline:"none",boxSizing:"border-box",marginBottom:12}}/>
+                <Btn onClick={()=>{if(adminPinInput===settings.adminPin)setPinOk(true);else{setAdminPinInput("");alert("รหัสไม่ถูกต้อง");}}} variant="primary" style={{width:"100%",padding:"12px 0",fontSize:15}}>เข้าสู่ระบบ</Btn>
+                <div style={{fontSize:12,color:T.textMuted,marginTop:10}}>รหัสเริ่มต้น: 1234</div>
+              </div>
+            ):(
+              <>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
+                  <div style={{fontFamily:"'Prompt',sans-serif",fontSize:18,fontWeight:700,color:T.text}}>⚙️ จัดการระบบ</div>
+                  <div style={{display:"flex",gap:8}}>
+                    <Btn onClick={()=>setShowHistory(true)} variant="ghost" style={{fontSize:13}}>📋 ประวัติ</Btn>
+                    <Btn onClick={()=>{setPinOk(false);setAdminPinInput("");}} variant="ghost" style={{fontSize:13}}>🔒 ล็อก</Btn>
+                  </div>
+                </div>
+
+                {/* แจ้งเตือนสต็อก */}
+                {(lowStockItems.length>0||outOfStockItems.length>0)&&(
+                  <div style={{background:T.redLight,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"10px 14px",marginBottom:14,fontSize:13}}>
+                    <div style={{fontWeight:700,color:T.red,marginBottom:6}}>⚠️ แจ้งเตือนสต็อก</div>
+                    {outOfStockItems.map(p=>(
+                      <div key={p.id} style={{color:T.red,fontSize:12,marginBottom:3}}>{p.emoji} {p.name} — <strong>หมดแล้ว</strong></div>
+                    ))}
+                    {lowStockItems.map(p=>(
+                      <div key={p.id} style={{color:"#B45309",fontSize:12,marginBottom:3}}>{p.emoji} {p.name} — เหลือ <strong>{p.stock} {p.unit}</strong></div>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{display:"flex",gap:6,marginBottom:20,background:T.bg,borderRadius:T.radiusSm,padding:4}}>
+                  {[{k:"products",lbl:"🍊 สินค้า"},{k:"settings",lbl:"⚙️ ตั้งค่า"}].map(t=>(
+                    <button key={t.k} onClick={()=>setAdminSubTab(t.k)}
+                      style={{flex:1,padding:"8px 0",borderRadius:6,border:"none",cursor:"pointer",fontFamily:"'Prompt',sans-serif",fontWeight:600,fontSize:13,background:adminSubTab===t.k?T.accent:"transparent",color:adminSubTab===t.k?"#fff":T.textSub,transition:"all 0.15s"}}>
+                      {t.lbl}
+                    </button>
+                  ))}
+                </div>
+
+                {adminSubTab==="products"&&(<>
+                  {/* เพิ่มสินค้า */}
+                  <Card style={{padding:16,marginBottom:16}}>
+                    <div style={{fontWeight:700,marginBottom:12,color:T.text}}>➕ เพิ่มสินค้าใหม่</div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                      <div style={{position:"relative"}}>
+                        <button onClick={()=>setShowEmoji(!showEmoji)} style={{fontSize:28,background:T.bg,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 10px",cursor:"pointer"}}>
+                          {newProd.emoji}
+                        </button>
+                        {showEmoji&&(
+                          <div style={{position:"absolute",top:50,left:0,background:T.surface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:8,display:"flex",flexWrap:"wrap",gap:4,width:220,zIndex:20,boxShadow:T.shadowMd}}>
+                            {EMOJIS.map(e=><button key={e} onClick={()=>{setNewProd(p=>({...p,emoji:e}));setShowEmoji(false);}} style={{fontSize:22,background:"none",border:"none",cursor:"pointer",padding:4,borderRadius:4}}>{e}</button>)}
+                          </div>
+                        )}
+                      </div>
+                      {[{ph:"ชื่อสินค้า",key:"name",w:110},{ph:"ราคา/หน่วย",key:"price",w:80,type:"number"},{ph:"ต้นทุน",key:"cost",w:70,type:"number"}].map(f=>(
+                        <input key={f.key} type={f.type||"text"} placeholder={f.ph} value={newProd[f.key]}
+                          onChange={e=>setNewProd(p=>({...p,[f.key]:e.target.value}))}
+                          style={{border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 10px",fontSize:13,outline:"none",width:f.w,background:T.bg,color:T.text}}/>
+                      ))}
+                      <select value={newProd.unit} onChange={e=>setNewProd(p=>({...p,unit:e.target.value}))}
+                        style={{border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 10px",fontSize:13,outline:"none",background:T.bg,color:T.text}}>
+                        {["กก.","ลูก","หวี","กล่อง","ชิ้น"].map(u=><option key={u}>{u}</option>)}
+                      </select>
+                      <input type="number" placeholder="สต็อก" value={newProd.stock}
+                        onChange={e=>setNewProd(p=>({...p,stock:e.target.value}))}
+                        style={{border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 10px",fontSize:13,outline:"none",width:65,background:T.bg,color:T.text}}/>
+                      <input type="number" placeholder="แจ้งที่" value={newProd.lowAlert}
+                        onChange={e=>setNewProd(p=>({...p,lowAlert:+e.target.value}))}
+                        style={{border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 10px",fontSize:13,outline:"none",width:60,background:T.bg,color:T.text}}
+                        title="แจ้งเตือนเมื่อสต็อกเหลือน้อยกว่าค่านี้"/>
+                      <label style={{fontSize:12,color:T.textSub,display:"flex",alignItems:"center",gap:4,cursor:"pointer",whiteSpace:"nowrap"}}>
+                        <input type="checkbox" checked={newProd.byWeight} onChange={e=>setNewProd(p=>({...p,byWeight:e.target.checked}))}/> ⚖️ ชั่ง
+                      </label>
+                      <Btn onClick={addProd} variant="primary" style={{padding:"8px 20px"}}>เพิ่ม</Btn>
+                    </div>
+                    <div style={{fontSize:11,color:T.textMuted,marginTop:8}}>💡 "แจ้งที่" = แจ้งเตือนเมื่อสต็อกเหลือน้อยกว่าค่านี้</div>
+                  </Card>
+
+                  {/* รายการสินค้า */}
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {products.map(p=>(
+                      <Card key={p.id} style={{padding:"12px 14px",display:"flex",alignItems:"center",gap:10,opacity:p.active?1:0.5}}>
+                        <span style={{fontSize:28,flexShrink:0}}>{p.emoji}</span>
+                        {editingId===p.id
+                          ?<EditRow p={p} onSave={u=>{setProducts(prev=>prev.map(x=>x.id===p.id?{...x,...u}:x));setEditingId(null);}} onCancel={()=>setEditingId(null)}/>
+                          :<>
+                            <div style={{flex:1,minWidth:0}}>
+                              <span style={{fontWeight:700,fontSize:14}}>{p.name}</span>
+                              <span style={{color:T.accent,fontSize:13,marginLeft:8}}>฿{p.price}/{p.unit}</span>
+                              {p.cost>0&&<span style={{color:T.textMuted,fontSize:11,marginLeft:6}}>ทุน฿{p.cost}</span>}
+                              <span style={{color:p.byWeight?T.blue:T.textMuted,fontSize:11,marginLeft:6}}>{p.byWeight?"⚖️":"📦"}</span>
+                              <span style={{color:p.stock<=(p.lowAlert||3)?T.red:T.textMuted,fontSize:12,marginLeft:6,fontWeight:p.stock<=(p.lowAlert||3)?700:400}}>
+                                สต็อก {p.stock} {p.stock<=(p.lowAlert||3)&&"⚠️"}
+                              </span>
+                            </div>
+                            <div style={{display:"flex",gap:6,flexShrink:0}}>
+                              <button onClick={()=>setEditingId(p.id)} style={{background:T.blueLight,border:"none",borderRadius:6,cursor:"pointer",padding:"5px 8px",fontSize:13}}>✏️</button>
+                              <button onClick={()=>setProducts(prev=>prev.map(x=>x.id===p.id?{...x,active:!x.active}:x))} style={{background:T.bg,border:`1px solid ${T.border}`,borderRadius:6,cursor:"pointer",padding:"5px 8px",fontSize:13}}>{p.active?"👁️":"🚫"}</button>
+                              <button onClick={()=>deleteProduct(p.id)} style={{background:T.redLight,border:"none",borderRadius:6,cursor:"pointer",padding:"5px 8px",fontSize:13}}>🗑️</button>
+                            </div>
+                          </>
+                        }
+                      </Card>
+                    ))}
+                  </div>
+                </>)}
+
+                {adminSubTab==="settings"&&(
+                  <div style={{display:"flex",flexDirection:"column",gap:16,maxWidth:480}}>
+
+                    {/* 🔥 โหมดลดราคาด่วน */}
+                    <Card style={{padding:20}}>
+                      <div style={{fontWeight:700,marginBottom:14,fontSize:15,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <span>🔥 โหมดลดราคาด่วน</span>
+                        <button onClick={()=>setSettings(s=>({...s,discountActive:!s.discountActive}))}
+                          style={{padding:"6px 16px",borderRadius:20,border:"none",cursor:"pointer",fontFamily:"'Prompt',sans-serif",fontWeight:700,fontSize:13,background:settings.discountActive?T.red:T.green,color:"#fff",transition:"all 0.2s"}}>
+                          {settings.discountActive?"🔴 ปิดโหมดลด":"🟢 เปิดโหมดลด"}
+                        </button>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:12}}>
+                        <div style={{flex:1}}>
+                          <div style={{fontSize:12,color:T.textMuted,marginBottom:6}}>ส่วนลด (%)</div>
+                          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                            {[5,10,15,20,30,50].map(v=>(
+                              <button key={v} onClick={()=>setSettings(s=>({...s,discountPct:v}))}
+                                style={{padding:"6px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${settings.discountPct===v?T.accent:T.border}`,background:settings.discountPct===v?T.accentLight:T.surface,color:settings.discountPct===v?T.accent:T.textSub,fontWeight:settings.discountPct===v?700:400,cursor:"pointer",fontSize:13,fontFamily:"'Prompt',sans-serif"}}>
+                                {v}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                      {settings.discountActive&&(
+                        <div style={{marginTop:12,background:T.redLight,borderRadius:T.radiusSm,padding:"8px 12px",fontSize:13,color:T.red,fontWeight:600}}>
+                          🔥 กำลังลดราคาทุกสินค้า {settings.discountPct}% อยู่
+                        </div>
+                      )}
+                    </Card>
+
+                    {/* พร้อมเพย์ */}
+                    <Card style={{padding:20}}>
+                      <div style={{fontWeight:700,marginBottom:14,fontSize:15}}>📱 เบอร์พร้อมเพย์</div>
+                      <div style={{fontSize:12,color:T.textMuted,marginBottom:6}}>เบอร์โทรศัพท์ที่ลงทะเบียนพร้อมเพย์</div>
+                      <PhoneEditor value={settings.promptPayPhone} onChange={v=>setSettings(s=>({...s,promptPayPhone:v}))}/>
+                    </Card>
+
+                    {/* รหัส Admin */}
+                    <Card style={{padding:20}}>
+                      <div style={{fontWeight:700,marginBottom:14,fontSize:15}}>🔐 เปลี่ยนรหัส Admin</div>
+                      <AdminPinChanger current={settings.adminPin} onChange={pin=>setSettings(s=>({...s,adminPin:pin}))}/>
+                    </Card>
+
+                    {/* ผู้ขาย */}
+                    <Card style={{padding:20}}>
+                      <div style={{fontWeight:700,marginBottom:14,fontSize:15}}>👥 รายชื่อผู้ขาย</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+                        {settings.sellers.map(s=>(
+                          <div key={s} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:T.bg,borderRadius:T.radiusSm,padding:"8px 12px",border:`1px solid ${T.border}`}}>
+                            <span>👤 {s}</span>
+                            <button onClick={()=>deleteSeller(s)} style={{background:T.redLight,border:"none",borderRadius:6,color:T.red,cursor:"pointer",padding:"3px 8px",fontSize:12}}>ลบ</button>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{display:"flex",gap:8}}>
+                        <input value={newSellerInput} onChange={e=>setNewSellerInput(e.target.value)} placeholder="ชื่อผู้ขายใหม่"
+                          style={{flex:1,border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"8px 12px",fontSize:14,outline:"none",background:T.bg,color:T.text}}/>
+                        <Btn onClick={()=>{if(newSellerInput.trim()){setSettings(s=>({...s,sellers:[...s.sellers,newSellerInput.trim()]}));setNewSellerInput("");}}} variant="primary">เพิ่ม</Btn>
+                      </div>
+                    </Card>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ════ REPORT TAB ════ */}
+        {tab==="report"&&(
+          <div style={{flex:1,padding:20,overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+              <div style={{fontFamily:"'Prompt',sans-serif",fontSize:18,fontWeight:700,color:T.text}}>📊 รายงานยอดขาย</div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <select value={reportDate} onChange={e=>setReportDate(e.target.value)}
+                  style={{border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"7px 10px",fontSize:13,outline:"none",background:T.bg,color:T.text}}>
+                  <option value={todayKey()}>วันนี้</option>
+                  {allDates.filter(d=>d!==todayKey()).map(d=><option key={d} value={d}>{d}</option>)}
+                </select>
+                <Btn onClick={()=>downloadCSV("day")} variant="ghost" style={{fontSize:12}}>⬇️ CSV วันนี้</Btn>
+                <Btn onClick={()=>downloadCSV("all")} variant="ghost" style={{fontSize:12}}>⬇️ CSV ทั้งหมด</Btn>
+                <Btn onClick={()=>setShowHistory(true)} variant="ghost" style={{fontSize:12}}>📋 ประวัติ</Btn>
+              </div>
+            </div>
+
+            {/* Stats */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+              {[
+                {label:"ยอดขายรวม",value:`฿${fmt(rTotal)}`,icon:"💰",color:T.accent,bg:T.accentLight},
+                {label:"กำไรรวม",value:`฿${fmt(rProfit)}`,icon:"📈",color:T.green,bg:T.greenLight},
+                {label:"จำนวนบิล",value:`${rSales.length} บิล`,icon:"🧾",color:T.blue,bg:T.blueLight},
+                {label:"เฉลี่ย/บิล",value:`฿${fmt(rSales.length?rTotal/rSales.length:0)}`,icon:"💹",color:T.purple,bg:T.purpleLight},
+              ].map(c=>(
+                <Card key={c.label} style={{padding:"12px 14px",background:c.bg,borderColor:"transparent"}}>
+                  <div style={{fontSize:22,marginBottom:2}}>{c.icon}</div>
+                  <div style={{fontFamily:"'Prompt',sans-serif",fontSize:16,fontWeight:800,color:c.color}}>{c.value}</div>
+                  <div style={{fontSize:10,color:T.textMuted}}>{c.label}</div>
+                </Card>
+              ))}
+            </div>
+
+            {/* กราฟ 7 วัน */}
+            <Card style={{padding:16,marginBottom:14}}>
+              <div style={{fontWeight:700,marginBottom:8,fontSize:14}}>📅 ยอดขาย 7 วันล่าสุด</div>
+              <MiniBarChart data={last7} height={90}/>
+            </Card>
+
+            {/* Cash vs QR */}
+            <Card style={{padding:16,marginBottom:14}}>
+              <div style={{fontWeight:700,marginBottom:12,fontSize:14}}>💳 แยกยอดตามวิธีชำระ</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                {[
+                  {lbl:"เงินสด",icon:"💵",color:T.green,bg:T.greenLight,orders:cashO,total:cashT},
+                  {lbl:"พร้อมเพย์",icon:"📱",color:T.blue,bg:T.blueLight,orders:qrO,total:qrT},
+                ].map((m,i)=>(
+                  <div key={i} style={{background:m.bg,borderRadius:T.radiusSm,padding:14}}>
+                    <div style={{fontSize:28}}>{m.icon}</div>
+                    <div style={{fontFamily:"'Prompt',sans-serif",fontSize:20,fontWeight:800,color:m.color}}>฿{fmt(m.total)}</div>
+                    <div style={{fontSize:12,color:T.textSub}}>{m.lbl} · {m.orders.length} บิล</div>
+                    {rTotal>0&&<>
+                      <div style={{height:4,background:"#fff",borderRadius:3,overflow:"hidden",marginTop:8}}>
+                        <div style={{height:"100%",width:`${((m.total/rTotal)*100).toFixed(1)}%`,background:m.color,borderRadius:3}}/>
+                      </div>
+                      <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>{((m.total/rTotal)*100).toFixed(1)}%</div>
+                    </>}
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+              {/* สินค้าขายดี */}
+              <Card style={{padding:14}}>
+                <div style={{fontWeight:700,marginBottom:10,fontSize:13}}>🏆 สินค้าขายดี</div>
+                {topItems().length===0
+                  ?<div style={{color:T.textMuted,fontSize:13}}>ยังไม่มีข้อมูล</div>
+                  :topItems().map(([name,qty],i)=>(
+                    <div key={name} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:i<topItems().length-1?`1px solid ${T.border}`:"none"}}>
+                      <span style={{fontSize:12}}>{["🥇","🥈","🥉","4️⃣","5️⃣"][i]} {name}</span>
+                      <span style={{fontWeight:700,color:T.accent,fontSize:12}}>{typeof qty==="number"&&qty%1!==0?qty.toFixed(2)+" กก.":`${qty} ชิ้น`}</span>
+                    </div>
+                  ))
+                }
+              </Card>
+
+              {/* บิลล่าสุด */}
+              <Card style={{padding:14}}>
+                <div style={{fontWeight:700,marginBottom:10,fontSize:13}}>🕐 บิลล่าสุด</div>
+                {rSales.length===0
+                  ?<div style={{color:T.textMuted,fontSize:13}}>ยังไม่มีการขาย</div>
+                  :[...rSales].reverse().slice(0,7).map(o=>(
+                    <div key={o.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${T.border}`}}>
+                      <div>
+                        <div style={{fontSize:12}}>{o.time}</div>
+                        <div style={{fontSize:10,color:T.textMuted}}>{o.method==="cash"?"💵":"📱"} {o.sellerName||""}</div>
+                      </div>
+                      <span style={{fontWeight:700,color:T.accent,fontSize:13}}>฿{fmt(o.total)}</span>
+                    </div>
+                  ))
+                }
+              </Card>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Phone Editor ──────────────────────────────────────────────
+function PhoneEditor({value,onChange}){
+  const [v,setV]=useState(value);
+  const [saved,setSaved]=useState(false);
+  const save=()=>{onChange(v);setSaved(true);setTimeout(()=>setSaved(false),2000);};
+  return(
+    <div style={{display:"flex",gap:8}}>
+      <input value={v} onChange={e=>setV(e.target.value)} placeholder="0812345678"
+        style={{flex:1,border:`1.5px solid ${T.border}`,borderRadius:T.radiusSm,padding:"9px 12px",fontSize:14,outline:"none",background:T.bg,color:T.text}}/>
+      <Btn onClick={save} variant={saved?"success":"primary"}>{saved?"✅":"บันทึก"}</Btn>
+    </div>
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(<FruitPOS/>);
+</script>
+</body>
+</html>
