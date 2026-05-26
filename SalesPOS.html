@@ -208,15 +208,15 @@ const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 // ══ Firebase Config ════════════════════════════
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyAWUobHuLjV_Fg_sFrymU0WV9FLXCmacOA",
-  authDomain: "pos-test-73b5f.firebaseapp.com",
-  databaseURL: "https://pos-test-73b5f-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "pos-test-73b5f",
-  storageBucket: "pos-test-73b5f.firebasestorage.app",
-  messagingSenderId: "503650135057",
-  appId: "1:503650135057:web:ef528741dd35899cf415b0"
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://YOUR_PROJECT-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "YOUR_PROJECT",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
 };
-const FIREBASE_READY = FIREBASE_CONFIG.apiKey !== "AIzaSyAWUobHuLjV_Fg_sFrymU0WV9FLXCmacOA";
+const FIREBASE_READY = FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY";
 let db = null;
 if (FIREBASE_READY) {
   try { const app = firebase.initializeApp(FIREBASE_CONFIG); db = firebase.database(app); }
